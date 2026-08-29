@@ -43,6 +43,8 @@ pub struct InteractiveApp {
     pub scanning_done: bool,
     pub threads: usize,
     pub json_filter: bool,
+    pub range_start: u64,
+    pub range_end: u64,
 }
 
 impl InteractiveApp {
@@ -62,6 +64,8 @@ impl InteractiveApp {
             scanning_done: false,
             threads: 0,
             json_filter: false,
+            range_start: 0,
+            range_end: 0,
         }
     }
 
@@ -178,12 +182,15 @@ pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::er
     let region_size = args.region.max(args.chunk as u64);
     let threads = args.threads;
     let json_filter = args.json;
+    let range_start = args.start_offset.unwrap_or(0).min(file_size);
+    let range_end = args.end_offset.unwrap_or(file_size).min(file_size).max(range_start);
+    let range_len = range_end.saturating_sub(range_start);
 
     let (tx, rx) = std::sync::mpsc::channel::<ScanResult>();
-    let total_regions = if file_size == 0 {
+    let total_regions = if range_len == 0 {
         0
     } else {
-        ((file_size + region_size - 1) / region_size) as usize
+        ((range_len + region_size - 1) / region_size) as usize
     };
     let completed = Arc::new(AtomicUsize::new(0));
     let completed_clone = Arc::clone(&completed);
@@ -191,12 +198,22 @@ pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::er
 
     let overlap: u64 = 4096;
     std::thread::spawn(move || {
-        if file_size == 0 {
+        if range_len == 0 {
             return;
         }
-        let starts: Vec<u64> = (0..file_size).step_by(region_size as usize).collect();
+        let starts: Vec<u64> = (range_start..range_end).step_by(region_size as usize).collect();
         starts.par_iter().for_each(|&start| {
-            match scan_region_strings(&path_clone, start, region_size, file_size, chunk_size, min_string, overlap, json_filter) {
+            match scan_region_strings(
+                &path_clone,
+                start,
+                region_size,
+                file_size,
+                chunk_size,
+                min_string,
+                overlap,
+                json_filter,
+                range_end,
+            ) {
                 Ok(vec) => {
                     for r in vec {
                         let _ = tx.send(r);
@@ -218,6 +235,8 @@ pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::er
     app.total_regions = total_regions;
     app.threads = threads;
     app.json_filter = json_filter;
+    app.range_start = range_start;
+    app.range_end = range_end;
 
     let res = run_loop(&mut terminal, &mut app, rx, completed, file_size);
 
@@ -434,6 +453,11 @@ fn draw_ui(f: &mut Frame, app: &mut InteractiveApp, file_size: u64, completed: u
         threads_label
     );
     let json_tag = if app.json_filter { " JSON:on" } else { "" };
+    let range_tag = if app.range_start != 0 || app.range_end != file_size && file_size != 0 {
+        format!(" Range: 0x{:08X}..0x{:08X}", app.range_start, app.range_end)
+    } else {
+        String::new()
+    };
     let header_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
@@ -441,14 +465,15 @@ fn draw_ui(f: &mut Frame, app: &mut InteractiveApp, file_size: u64, completed: u
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(format!(
-            " Found: {}  Filter: {}{} ",
+            " Found: {}  Filter: {}{}{} ",
             app.results.len(),
             if app.filter.is_empty() {
                 "none".to_string()
             } else {
                 format!("\"{}\" ({} matches)", app.filter, app.filtered_len())
             },
-            json_tag
+            json_tag,
+            range_tag
         )));
 
     let header_text = Paragraph::new(title).block(header_block);

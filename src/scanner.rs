@@ -37,17 +37,38 @@ pub fn collect_files(input: &Path, recursive: bool, jobs: &mut Vec<FileJob>) -> 
 }
 
 pub fn scan_file(job: &FileJob, args: &Args) -> io::Result<Vec<ScanResult>> {
-    println!(
-        "\n============================================================\nFILE: {}\nSIZE: {} bytes (0x{:X})\n============================================================",
-        job.path.display(),
-        job.size,
-        job.size
-    );
-    if job.size == 0 {
+    // Resolve direct range access: start_offset..end_offset (exclusive)
+    let range_start = args.start_offset.unwrap_or(0).min(job.size);
+    let range_end = args.end_offset.unwrap_or(job.size).min(job.size);
+    let range_start = range_start.min(range_end);
+    let range_len = range_end.saturating_sub(range_start);
+
+    if range_start != 0 || range_end != job.size {
+        println!(
+            "\n============================================================\nFILE: {}\nSIZE: {} bytes (0x{:X})\nRANGE: 0x{:08X}..0x{:08X} ({} bytes)\n============================================================",
+            job.path.display(),
+            job.size,
+            job.size,
+            range_start,
+            range_end,
+            range_len
+        );
+    } else {
+        println!(
+            "\n============================================================\nFILE: {}\nSIZE: {} bytes (0x{:X})\n============================================================",
+            job.path.display(),
+            job.size,
+            job.size
+        );
+    }
+    if job.size == 0 || range_len == 0 {
+        if range_len == 0 && (args.start_offset.is_some() || args.end_offset.is_some()) {
+            println!("[range empty — no bytes to scan]");
+        }
         return Ok(Vec::new());
     }
     let region = args.region.max(args.chunk as u64);
-    let starts: Vec<u64> = (0..job.size).step_by(region as usize).collect();
+    let starts: Vec<u64> = (range_start..range_end).step_by(region as usize).collect();
     let path = Arc::new(job.path.clone());
     let overlap: u64 = 4096;
 
@@ -71,6 +92,7 @@ pub fn scan_file(job: &FileJob, args: &Args) -> io::Result<Vec<ScanResult>> {
                 args.min_string,
                 overlap,
                 args.json,
+                range_end,
             )?;
             Ok(RegionData {
                 start,
@@ -121,8 +143,11 @@ pub fn scan_region_with_results(
     min_string: usize,
     overlap: u64,
     json_filter: bool,
+    range_end: u64,
 ) -> io::Result<(String, Vec<ScanResult>)> {
-    let end = start.saturating_add(region_size).min(file_size);
+    // range_end is the exclusive scan limit for hex output; file_size is original for % display
+    // string_end may extend beyond range_end to capture strings that start inside range but end outside
+    let end = start.saturating_add(region_size).min(range_end);
     let string_end = end.saturating_add(overlap).min(file_size);
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
@@ -163,25 +188,35 @@ pub fn scan_region_with_results(
         let bytes = &buffer[..read];
 
         if is_hex_part && !strings_only {
-            if !hex_only {
-                output.push_str(&format!("\n0x{offset:016X}  "));
-            } else {
-                output.push_str(&format!("0x{offset:016X}  "));
-            }
-            for byte in bytes {
-                output.push_str(&format!("{byte:02X} "));
-            }
-            if !hex_only {
-                output.push_str(" | ");
-                for &byte in bytes {
-                    output.push(if byte.is_ascii_graphic() || byte == b' ' {
-                        byte as char
-                    } else {
-                        '.'
-                    });
+            // Dump as 16 bytes per line for readable hex + ASCII, matching spec
+            for (i, chunk) in bytes.chunks(16).enumerate() {
+                let addr = offset + i as u64 * 16;
+                if !hex_only {
+                    output.push_str(&format!("\n0x{addr:08X}  "));
+                } else {
+                    output.push_str(&format!("0x{addr:08X}  "));
                 }
+                for byte in chunk {
+                    output.push_str(&format!("{byte:02X} "));
+                }
+                // pad to 16*3 for alignment when chunk <16
+                if chunk.len() < 16 {
+                    for _ in 0..(16 - chunk.len()) {
+                        output.push_str("   ");
+                    }
+                }
+                if !hex_only {
+                    output.push_str(" | ");
+                    for &byte in chunk {
+                        output.push(if byte.is_ascii_graphic() || byte == b' ' {
+                            byte as char
+                        } else {
+                            '.'
+                        });
+                    }
+                }
+                output.push('\n');
             }
-            output.push('\n');
         }
 
         if !hex_only {
@@ -335,9 +370,10 @@ pub fn scan_region_strings(
     min_string: usize,
     overlap: u64,
     json_filter: bool,
+    range_end: u64,
 ) -> io::Result<Vec<ScanResult>> {
-    let end = start.saturating_add(region_size).min(file_size);
-    let string_end = end.saturating_add(overlap).min(file_size);
+    let end = start.saturating_add(region_size).min(range_end);
+    let string_end = end.saturating_add(overlap).min(range_end);
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
     let mut buffer = vec![0u8; chunk_size];
