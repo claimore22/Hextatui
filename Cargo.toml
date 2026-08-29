@@ -9,14 +9,6 @@ keywords = ["hex", "ratatui", "tui", "binary", "explorer"]
 categories = ["command-line-utilities", "visualization"]
 license = "MIT"
 
-[[bin]]
-name = "hextatui"
-path = "src/main.rs"
-
-[[bin]]
-name = "binary-scan"
-path = "src/main.rs"
-
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 rayon = "1.10"
