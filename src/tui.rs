@@ -17,7 +17,8 @@ use ratatui::{
 };
 use rayon::prelude::*;
 use std::{
-    io,
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -36,6 +37,9 @@ pub struct InteractiveApp {
     pub goto_input: bool,
     pub goto_buf: String,
     pub hex_view: bool,
+    pub raw_hex_mode: bool,
+    pub hex_offset: u64,
+    pub hex_cursor: u64,
     pub selected: usize,
     pub scroll_offset: usize,
     pub total_regions: usize,
@@ -57,6 +61,9 @@ impl InteractiveApp {
             goto_input: false,
             goto_buf: String::new(),
             hex_view: false,
+            raw_hex_mode: false,
+            hex_offset: 0,
+            hex_cursor: 0,
             selected: 0,
             scroll_offset: 0,
             total_regions: 0,
@@ -197,33 +204,39 @@ pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::er
     let path_clone = file_path.clone();
 
     let overlap: u64 = 4096;
-    std::thread::spawn(move || {
-        if range_len == 0 {
-            return;
-        }
-        let starts: Vec<u64> = (range_start..range_end).step_by(region_size as usize).collect();
-        starts.par_iter().for_each(|&start| {
-            match scan_region_strings(
-                &path_clone,
-                start,
-                region_size,
-                file_size,
-                chunk_size,
-                min_string,
-                overlap,
-                json_filter,
-                range_end,
-            ) {
-                Ok(vec) => {
-                    for r in vec {
-                        let _ = tx.send(r);
-                    }
-                }
-                Err(_) => {}
+    let raw_hex = args.hex_only;
+    if !raw_hex {
+        std::thread::spawn(move || {
+            if range_len == 0 {
+                return;
             }
-            completed_clone.fetch_add(1, Ordering::Relaxed);
+            let starts: Vec<u64> = (range_start..range_end).step_by(region_size as usize).collect();
+            starts.par_iter().for_each(|&start| {
+                match scan_region_strings(
+                    &path_clone,
+                    start,
+                    region_size,
+                    file_size,
+                    chunk_size,
+                    min_string,
+                    overlap,
+                    json_filter,
+                    range_end,
+                ) {
+                    Ok(vec) => {
+                        for r in vec {
+                            let _ = tx.send(r);
+                        }
+                    }
+                    Err(_) => {}
+                }
+                completed_clone.fetch_add(1, Ordering::Relaxed);
+            });
         });
-    });
+    } else {
+        // raw hex mode: no string scan needed
+        completed.store(total_regions, Ordering::Relaxed);
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -237,6 +250,12 @@ pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::er
     app.json_filter = json_filter;
     app.range_start = range_start;
     app.range_end = range_end;
+    app.raw_hex_mode = raw_hex;
+    if raw_hex {
+        app.hex_offset = range_start;
+        app.hex_cursor = range_start;
+        app.scanning_done = true;
+    }
 
     let res = run_loop(&mut terminal, &mut app, rx, completed, file_size);
 
@@ -355,7 +374,16 @@ fn run_loop<B: ratatui::backend::Backend>(
                             app.goto_buf.clear();
                         }
                         KeyCode::Enter => {
-                            handle_goto(app);
+                            if app.raw_hex_mode {
+                                let input = app.goto_buf.trim().to_string();
+                                if let Ok(off) = parse_goto_offset(&input) {
+                                    let clamped = off.clamp(app.range_start, app.range_end.saturating_sub(1));
+                                    app.hex_cursor = clamped;
+                                    app.hex_offset = clamped & !0xF;
+                                }
+                            } else {
+                                handle_goto(app);
+                            }
                             app.goto_input = false;
                             app.goto_buf.clear();
                         }
@@ -377,6 +405,66 @@ fn run_loop<B: ratatui::backend::Backend>(
                         KeyCode::Up => app.move_selection(-1),
                         KeyCode::Down => app.move_selection(1),
                         KeyCode::Enter => app.hex_view = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if app.raw_hex_mode {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.hex_cursor = app.hex_cursor.saturating_sub(16).max(app.range_start);
+                            if app.hex_cursor < app.hex_offset {
+                                app.hex_offset = app.hex_cursor & !0xF;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let next = (app.hex_cursor + 16).min(app.range_end.saturating_sub(1));
+                            app.hex_cursor = next;
+                            // keep cursor visible: if beyond visible window, scroll
+                            // visible window is approx 20 rows; we approximate with page_size rows
+                            let rows = (app.page_size.min(40) as u64) * 16;
+                            if app.hex_cursor >= app.hex_offset + rows {
+                                app.hex_offset = (app.hex_cursor & !0xF).saturating_sub(rows - 16);
+                            }
+                        }
+                        KeyCode::Left => {
+                            app.hex_cursor = app.hex_cursor.saturating_sub(1).max(app.range_start);
+                            if app.hex_cursor < app.hex_offset {
+                                app.hex_offset = app.hex_cursor & !0xF;
+                            }
+                        }
+                        KeyCode::Right => {
+                            app.hex_cursor = (app.hex_cursor + 1).min(app.range_end.saturating_sub(1));
+                            let rows = (app.page_size.min(40) as u64) * 16;
+                            if app.hex_cursor >= app.hex_offset + rows {
+                                app.hex_offset = (app.hex_cursor & !0xF).saturating_sub(rows - 16);
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            let page = (app.page_size.min(40) as u64) * 16;
+                            app.hex_offset = app.hex_offset.saturating_sub(page).max(app.range_start & !0xF);
+                            app.hex_cursor = app.hex_cursor.saturating_sub(page).max(app.range_start);
+                        }
+                        KeyCode::PageDown => {
+                            let page = (app.page_size.min(40) as u64) * 16;
+                            let max_off = app.range_end.saturating_sub(16);
+                            app.hex_offset = (app.hex_offset + page).min(max_off & !0xF);
+                            app.hex_cursor = (app.hex_cursor + page).min(app.range_end.saturating_sub(1));
+                        }
+                        KeyCode::Home => {
+                            app.hex_offset = app.range_start & !0xF;
+                            app.hex_cursor = app.range_start;
+                        }
+                        KeyCode::End => {
+                            let page = (app.page_size.min(40) as u64) * 16;
+                            app.hex_offset = app.range_end.saturating_sub(page).max(app.range_start) & !0xF;
+                            app.hex_cursor = app.range_end.saturating_sub(1);
+                        }
+                        KeyCode::Char('g') | KeyCode::Char('G') => {
+                            app.goto_input = true;
+                            app.goto_buf.clear();
+                        }
                         _ => {}
                     }
                     continue;
@@ -494,7 +582,9 @@ fn draw_ui(f: &mut Frame, app: &mut InteractiveApp, file_size: u64, completed: u
     let progress = Paragraph::new(progress_label).style(Style::default().fg(Color::Yellow));
     f.render_widget(progress, chunks[1]);
 
-    if app.hex_view {
+    if app.raw_hex_mode {
+        draw_raw_hex(f, chunks[2], app, file_size);
+    } else if app.hex_view {
         draw_hex_view(f, chunks[2], app, file_size);
     } else {
         draw_table(f, chunks[2], app, file_size);
@@ -506,6 +596,11 @@ fn draw_ui(f: &mut Frame, app: &mut InteractiveApp, file_size: u64, completed: u
         format!(" Goto (page # or 0x offset): {}█ ", app.goto_buf)
     } else if app.filter_input {
         format!(" Filter: {}█  (Enter to apply, Esc to cancel)", app.goto_buf)
+    } else if app.raw_hex_mode {
+        format!(
+            " Offset: 0x{:08X}  Cursor: 0x{:08X}  Range: 0x{:08X}..0x{:08X}  [↑↓] Row  [←→] Byte  [PgUp/PgDn] Page  [G] Goto  [Q] Quit ",
+            app.hex_offset, app.hex_cursor, app.range_start, app.range_end
+        )
     } else {
         format!(
             " Page {cur_page}/{total_pages}  Selected: #{}  [→] Next  [←] Prev  [↑↓] Select  [Enter] Inspect  [F] Filter  [G] Goto  [H] Hex  [Q] Quit ",
@@ -619,5 +714,120 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut InteractiveApp, file_size: u6
         )
         .row_highlight_style(Style::default().bg(Color::DarkGray));
 
+    f.render_widget(table, area);
+}
+
+fn parse_goto_offset(s: &str) -> Result<u64, String> {
+    let t = s.trim().replace('_', "").replace(',', "");
+    if t.starts_with("0x") || t.starts_with("0X") {
+        u64::from_str_radix(&t[2..], 16).map_err(|e| format!("{e}"))
+    } else {
+        t.parse::<u64>().map_err(|e| format!("{e}"))
+    }
+}
+
+fn draw_raw_hex(f: &mut Frame, area: Rect, app: &InteractiveApp, _file_size: u64) {
+    let viewport_h = (area.height as usize).saturating_sub(4).max(1);
+    let rows = viewport_h;
+    let start = app.hex_offset & !0xF;
+    let end = app.range_end;
+    // read rows*16 bytes from start
+    let to_read = (rows as u64) * 16;
+    let actual_end = (start + to_read).min(end);
+    let len = (actual_end.saturating_sub(start)) as usize;
+    let mut buf = vec![0u8; len];
+    let mut read_len = 0usize;
+    if len > 0 {
+        if let Ok(mut file) = File::open(&app.file_path) {
+            let _ = file.seek(SeekFrom::Start(start));
+            if let Ok(n) = file.read(&mut buf) {
+                read_len = n;
+                buf.truncate(n);
+            }
+        }
+    }
+    let header = Row::new(vec![
+        Cell::from("Offset"),
+        Cell::from("Hex"),
+        Cell::from("ASCII"),
+    ])
+    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    .height(1);
+
+    let mut table_rows: Vec<Row> = Vec::new();
+    for (i, chunk) in buf.chunks(16).enumerate() {
+        let addr = start + i as u64 * 16;
+        let is_cursor_line = app.hex_cursor >= addr && app.hex_cursor < addr + 16;
+        let mut hex_str = String::new();
+        for (j, b) in chunk.iter().enumerate() {
+            let cur_addr = addr + j as u64;
+            if cur_addr == app.hex_cursor {
+                hex_str.push_str(&format!("[{:02X}]", b));
+            } else {
+                hex_str.push_str(&format!(" {:02X} ", b));
+            }
+            if j == 7 {
+                hex_str.push(' ');
+            }
+        }
+        // pad
+        if chunk.len() < 16 {
+            for _ in chunk.len()..16 {
+                hex_str.push_str("    ");
+            }
+        }
+        let mut ascii = String::new();
+        for &b in chunk {
+            ascii.push(if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '.'
+            });
+        }
+        let style = if is_cursor_line {
+            Style::default().bg(Color::DarkGray).fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let addr_str = format!("0x{:08X}", addr);
+        table_rows.push(
+            Row::new(vec![
+                Cell::from(addr_str),
+                Cell::from(hex_str),
+                Cell::from(ascii),
+            ])
+            .style(style)
+            .height(1),
+        );
+    }
+    if table_rows.is_empty() {
+        table_rows.push(Row::new(vec![
+            Cell::from(""),
+            Cell::from("No data in range"),
+            Cell::from(""),
+        ]));
+    }
+    let _ = read_len;
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(52),
+        Constraint::Min(16),
+    ];
+    let title = format!(
+        " Hex Dump  0x{:08X}..0x{:08X}  Cursor: 0x{:08X} ",
+        app.range_start, app.range_end, app.hex_cursor
+    );
+    let table = Table::new(table_rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_bottom(Line::from(format!(
+                    " {} rows  [G] Goto  [Q] Quit ",
+                    rows
+                ))),
+        )
+        .row_highlight_style(Style::default().bg(Color::DarkGray));
     f.render_widget(table, area);
 }
