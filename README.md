@@ -122,9 +122,34 @@ Press `Enter`:
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Non-interactive
+### All data (no filter) — default
 
-Still streams hex + strings (position-aware) and respects `--threads`/`--chunk`:
+No flag = **all data**: hex + ASCII + strings interleaved. You don't need `--strings`.
+
+```powershell
+hextatui game.utoc                      # hex + strings (default, position-aware)
+hextatui game.utoc --hex                # only hex+ASCII — raw dump of every byte (alias: --hex-only)
+hextatui game.utoc --strings            # only strings (alias: --strings-only)
+hextatui game.utoc --json --strings     # only JSON structures
+```
+
+### Non-interactive + Range
+
+Dump exactly a byte window `[START, END)` — exclusive `END` — hex or decimal:
+
+```powershell
+hextatui game.utoc --hex
+hextatui game.utoc --range 0x28100 0x28350 --hex
+hextatui game.utoc --range 0x28200 0x28220 --hex          # 0x20 bytes: 0x28200..0x2821F
+hextatui game.utoc --range 164096 164688 --hex
+hextatui game.utoc --range 0x28100 0x28350 --strings
+hextatui game.utoc --range 0x281D0 0x28280 --hex           # precise reproducible window
+
+# legacy aliases:
+hextatui game.utoc --start-offset 0x28100 --end-offset 0x28350 --hex
+```
+
+Still streams with `--threads`/`--chunk`:
 
 ```powershell
 hextatui game.pak
@@ -133,6 +158,7 @@ hextatui game.utoc --threads 24 --strings-only
 hextatui C:\path\to\game --threads 24
 hextatui game.elf --threads 24 --chunk 4096 --min-string 5
 hextatui game.utoc --threads 24 --output results.txt
+hextatui game.utoc --range 0x28100 0x28350 --output results.txt
 ```
 
 Output line format:
@@ -167,13 +193,18 @@ Also: `Home`/`End` to first/last result.
 Flags:
 
 ```
---threads 24        # 0 = Rayon default
---page-size 50      # rows per page in TUI
+--threads 24                    # 0 = Rayon default
+--page-size 50                  # rows per page in TUI (capped by viewport)
 --output results.txt
---chunk 4096        # read size inside each region
---region 67108864   # 64 MiB per worker
+--chunk 4096                    # read size inside each region
+--region 67108864               # 64 MiB per worker
 --min-string 4
---strings-only / --hex-only
+--strings-only / --strings      # only strings
+--hex-only / --hex               # only hex+ASCII (all data, no strings)
+--json                          # only valid JSON objects/arrays
+--range <START> <END>           # exact window [START,END) hex 0x... or decimal
+--start-offset <OFF> --end-offset <OFF>  # same as --range
+# no flag = all data (hex + strings interleaved)
 ```
 
 ## Architecture
