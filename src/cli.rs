@@ -50,4 +50,8 @@ pub struct Args {
     /// Write complete scan results to file (tabular, with offset/position)
     #[arg(long)]
     pub output: Option<PathBuf>,
+
+    /// Only show strings that are valid JSON structures (objects/arrays)
+    #[arg(long)]
+    pub json: bool,
 }

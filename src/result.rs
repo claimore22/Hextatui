@@ -41,6 +41,22 @@ pub fn format_with_commas(n: u64) -> String {
     out.chars().rev().collect()
 }
 
+pub fn is_json_structure(s: &str) -> bool {
+    let t = s.trim();
+    if t.len() < 2 {
+        return false;
+    }
+    let bytes = t.as_bytes();
+    let first = bytes[0] as char;
+    let last = bytes[bytes.len() - 1] as char;
+    // JSON structures are objects {} or arrays []
+    let is_struct = (first == '{' && last == '}') || (first == '[' && last == ']');
+    if !is_struct {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(t).is_ok()
+}
+
 pub fn write_results_table(results: &[ScanResult], file_size: u64, out: &Path) -> io::Result<()> {
     let mut f = File::create(out)?;
     use std::io::Write;

@@ -1,5 +1,5 @@
 use crate::cli::Args;
-use crate::result::{Encoding, FileJob, ScanResult};
+use crate::result::{is_json_structure, Encoding, FileJob, ScanResult};
 use rayon::prelude::*;
 use std::{
     fs::{self, File},
@@ -70,6 +70,7 @@ pub fn scan_file(job: &FileJob, args: &Args) -> io::Result<Vec<ScanResult>> {
                 args.hex_only,
                 args.min_string,
                 overlap,
+                args.json,
             )?;
             Ok(RegionData {
                 start,
@@ -103,6 +104,9 @@ pub fn scan_file(job: &FileJob, args: &Args) -> io::Result<Vec<ScanResult>> {
         }
         deduped.push(r);
     }
+    if args.json {
+        deduped.retain(|r| is_json_structure(&r.text));
+    }
     Ok(deduped)
 }
 
@@ -116,6 +120,7 @@ pub fn scan_region_with_results(
     hex_only: bool,
     min_string: usize,
     overlap: u64,
+    json_filter: bool,
 ) -> io::Result<(String, Vec<ScanResult>)> {
     let end = start.saturating_add(region_size).min(file_size);
     let string_end = end.saturating_add(overlap).min(file_size);
@@ -192,6 +197,7 @@ pub fn scan_region_with_results(
                 end,
                 &mut suppress,
                 start,
+                json_filter,
             );
         }
 
@@ -202,26 +208,30 @@ pub fn scan_region_with_results(
         if suppress && carry_start == start {
         } else if carry_start < end {
             let text = String::from_utf8_lossy(&carry).to_string();
-            let pct = if file_size > 0 {
-                (carry_start as f64 / file_size as f64) * 100.0
+            if json_filter && !is_json_structure(&text) {
+                // skip non-JSON tail
             } else {
-                0.0
-            };
-            output.push_str(&format!(
-                "[STRING 0x{carry_start:08X} dec={} pos={}/{} ({:.2}%) len={}] {}\n",
-                carry_start,
-                carry_start,
-                file_size,
-                pct,
-                carry.len(),
-                text
-            ));
-            scan_results.push(ScanResult {
-                offset: carry_start,
-                length: carry.len(),
-                encoding: Encoding::Ascii,
-                text,
-            });
+                let pct = if file_size > 0 {
+                    (carry_start as f64 / file_size as f64) * 100.0
+                } else {
+                    0.0
+                };
+                output.push_str(&format!(
+                    "[STRING 0x{carry_start:08X} dec={} pos={}/{} ({:.2}%) len={}] {}\n",
+                    carry_start,
+                    carry_start,
+                    file_size,
+                    pct,
+                    carry.len(),
+                    text
+                ));
+                scan_results.push(ScanResult {
+                    offset: carry_start,
+                    length: carry.len(),
+                    encoding: Encoding::Ascii,
+                    text,
+                });
+            }
         }
     }
 
@@ -254,6 +264,7 @@ fn extract_strings_with_results(
     primary_end: u64,
     suppress: &mut bool,
     region_start: u64,
+    json_filter: bool,
 ) {
     let mut current = std::mem::take(carry);
     let mut current_start = *carry_start;
@@ -274,6 +285,10 @@ fn extract_strings_with_results(
                 }
                 *suppress = false;
                 let text = String::from_utf8_lossy(&current).to_string();
+                if json_filter && !is_json_structure(&text) {
+                    current.clear();
+                    continue;
+                }
                 if current_start < primary_end {
                     let pct = if file_size > 0 {
                         (current_start as f64 / file_size as f64) * 100.0
@@ -319,6 +334,7 @@ pub fn scan_region_strings(
     chunk_size: usize,
     min_string: usize,
     overlap: u64,
+    json_filter: bool,
 ) -> io::Result<Vec<ScanResult>> {
     let end = start.saturating_add(region_size).min(file_size);
     let string_end = end.saturating_add(overlap).min(file_size);
@@ -361,18 +377,22 @@ pub fn scan_region_strings(
             &mut results,
             &mut suppress,
             start,
+            json_filter,
         );
         offset += read as u64;
         let _ = &_output_dummy;
         let _ = file_size;
     }
     if !carry.is_empty() && carry.len() >= min_string && carry_start < end && !(suppress && carry_start == start) {
-        results.push(ScanResult {
-            offset: carry_start,
-            length: carry.len(),
-            encoding: Encoding::Ascii,
-            text: String::from_utf8_lossy(&carry).to_string(),
-        });
+        let text = String::from_utf8_lossy(&carry).to_string();
+        if !json_filter || is_json_structure(&text) {
+            results.push(ScanResult {
+                offset: carry_start,
+                length: carry.len(),
+                encoding: Encoding::Ascii,
+                text,
+            });
+        }
     }
     results.retain(|r| r.offset >= start && r.offset < end);
     Ok(results)
@@ -435,6 +455,7 @@ fn extract_strings_simple_suppress(
     results: &mut Vec<ScanResult>,
     suppress: &mut bool,
     region_start: u64,
+    json_filter: bool,
 ) {
     let mut current = std::mem::take(carry);
     let mut current_start = *carry_start;
@@ -454,11 +475,16 @@ fn extract_strings_simple_suppress(
                     continue;
                 }
                 *suppress = false;
+                let text = String::from_utf8_lossy(&current).to_string();
+                if json_filter && !is_json_structure(&text) {
+                    current.clear();
+                    continue;
+                }
                 results.push(ScanResult {
                     offset: current_start,
                     length: current.len(),
                     encoding: Encoding::Ascii,
-                    text: String::from_utf8_lossy(&current).to_string(),
+                    text,
                 });
             } else if *suppress && current_start == region_start {
                 *suppress = false;

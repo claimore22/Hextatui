@@ -37,10 +37,12 @@ pub struct InteractiveApp {
     pub goto_buf: String,
     pub hex_view: bool,
     pub selected: usize,
+    pub scroll_offset: usize,
     pub total_regions: usize,
     pub page_size: usize,
     pub scanning_done: bool,
     pub threads: usize,
+    pub json_filter: bool,
 }
 
 impl InteractiveApp {
@@ -54,10 +56,12 @@ impl InteractiveApp {
             goto_buf: String::new(),
             hex_view: false,
             selected: 0,
+            scroll_offset: 0,
             total_regions: 0,
             page_size,
             scanning_done: false,
             threads: 0,
+            json_filter: false,
         }
     }
 
@@ -110,8 +114,13 @@ impl InteractiveApp {
         let len = self.filtered_len();
         if len == 0 {
             self.selected = 0;
+            self.scroll_offset = 0;
         } else if self.selected >= len {
             self.selected = len - 1;
+        }
+        // clamp scroll_offset after bounds change
+        if self.scroll_offset >= len {
+            self.scroll_offset = len.saturating_sub(1);
         }
     }
 
@@ -120,6 +129,7 @@ impl InteractiveApp {
         let cur = self.current_page();
         if cur + 1 < total {
             self.selected = (cur + 1) * self.page_size;
+            self.scroll_offset = self.selected;
             self.ensure_selected_in_bounds();
         }
     }
@@ -128,6 +138,7 @@ impl InteractiveApp {
         let cur = self.current_page();
         if cur > 0 {
             self.selected = (cur - 1) * self.page_size;
+            self.scroll_offset = self.selected;
         }
     }
 
@@ -145,6 +156,17 @@ impl InteractiveApp {
             self.selected = new as usize;
         }
     }
+
+    fn ensure_visible(&mut self, viewport_h: usize) {
+        if viewport_h == 0 {
+            return;
+        }
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + viewport_h {
+            self.scroll_offset = self.selected - viewport_h + 1;
+        }
+    }
 }
 
 pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -155,6 +177,7 @@ pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::er
     let chunk_size = args.chunk;
     let region_size = args.region.max(args.chunk as u64);
     let threads = args.threads;
+    let json_filter = args.json;
 
     let (tx, rx) = std::sync::mpsc::channel::<ScanResult>();
     let total_regions = if file_size == 0 {
@@ -173,7 +196,7 @@ pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::er
         }
         let starts: Vec<u64> = (0..file_size).step_by(region_size as usize).collect();
         starts.par_iter().for_each(|&start| {
-            match scan_region_strings(&path_clone, start, region_size, file_size, chunk_size, min_string, overlap) {
+            match scan_region_strings(&path_clone, start, region_size, file_size, chunk_size, min_string, overlap, json_filter) {
                 Ok(vec) => {
                     for r in vec {
                         let _ = tx.send(r);
@@ -194,6 +217,7 @@ pub fn run_interactive(job: &FileJob, args: &Args) -> Result<(), Box<dyn std::er
     let mut app = InteractiveApp::new(file_path.clone(), file_size, page_size);
     app.total_regions = total_regions;
     app.threads = threads;
+    app.json_filter = json_filter;
 
     let res = run_loop(&mut terminal, &mut app, rx, completed, file_size);
 
@@ -409,6 +433,7 @@ fn draw_ui(f: &mut Frame, app: &mut InteractiveApp, file_size: u64, completed: u
         file_size as f64 / (1024.0 * 1024.0),
         threads_label
     );
+    let json_tag = if app.json_filter { " JSON:on" } else { "" };
     let header_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
@@ -416,13 +441,14 @@ fn draw_ui(f: &mut Frame, app: &mut InteractiveApp, file_size: u64, completed: u
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(format!(
-            " Found: {}  Filter: {} ",
+            " Found: {}  Filter: {}{} ",
             app.results.len(),
             if app.filter.is_empty() {
                 "none".to_string()
             } else {
                 format!("\"{}\" ({} matches)", app.filter, app.filtered_len())
-            }
+            },
+            json_tag
         )));
 
     let header_text = Paragraph::new(title).block(header_block);
@@ -473,10 +499,29 @@ fn draw_ui(f: &mut Frame, app: &mut InteractiveApp, file_size: u64, completed: u
 
 fn draw_table(f: &mut Frame, area: Rect, app: &mut InteractiveApp, file_size: u64) {
     let filtered = app.filtered_indices();
+    let filtered_len = filtered.len();
     let total_pages = app.total_pages();
     let cur_page = app.current_page();
-    let start = cur_page * app.page_size;
-    let end = (start + app.page_size).min(filtered.len());
+
+    // viewport-aware: available rows inside the table block (borders + header + title)
+    let viewport_h = (area.height as usize).saturating_sub(4).max(1);
+    let display_h = if filtered_len == 0 {
+        0
+    } else {
+        viewport_h.min(app.page_size).min(filtered_len)
+    };
+
+    // keep selected visible: viewport = min(page_size, viewport_available)
+    if filtered_len > 0 {
+        app.ensure_visible(display_h);
+        if app.scroll_offset + display_h > filtered_len {
+            app.scroll_offset = filtered_len.saturating_sub(display_h);
+        }
+    } else {
+        app.scroll_offset = 0;
+    }
+    let start = app.scroll_offset;
+    let end = (start + display_h).min(filtered_len);
 
     let header = Row::new(vec![
         Cell::from("#"),
