@@ -758,34 +758,50 @@ fn draw_raw_hex(f: &mut Frame, area: Rect, app: &InteractiveApp, _file_size: u64
     for (i, chunk) in buf.chunks(16).enumerate() {
         let addr = start + i as u64 * 16;
         let is_cursor_line = app.hex_cursor >= addr && app.hex_cursor < addr + 16;
-        let mut hex_str = String::new();
-        for (j, b) in chunk.iter().enumerate() {
+        let mut hex_spans: Vec<Span> = Vec::new();
+        let mut ascii_spans: Vec<Span> = Vec::new();
+        for (j, &b) in chunk.iter().enumerate() {
             let cur_addr = addr + j as u64;
-            if cur_addr == app.hex_cursor {
-                hex_str.push_str(&format!("[{:02X}]", b));
+            let is_cursor_byte = cur_addr == app.hex_cursor;
+            // synchronized styles
+            let hex_style = if is_cursor_byte {
+                Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+            } else if is_cursor_line {
+                Style::default().fg(Color::Yellow)
             } else {
-                hex_str.push_str(&format!(" {:02X} ", b));
+                Style::default()
+            };
+            let ascii_style = if is_cursor_byte {
+                Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+            } else if b.is_ascii_graphic() || b == b' ' {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            if j == 8 {
+                hex_spans.push(Span::raw(" "));
             }
-            if j == 7 {
-                hex_str.push(' ');
-            }
-        }
-        // pad
-        if chunk.len() < 16 {
-            for _ in chunk.len()..16 {
-                hex_str.push_str("    ");
-            }
-        }
-        let mut ascii = String::new();
-        for &b in chunk {
-            ascii.push(if b.is_ascii_graphic() || b == b' ' {
+            // hex byte with trailing space, highlighted if cursor
+            hex_spans.push(Span::styled(format!("{:02X} ", b), hex_style));
+            // ascii char
+            let ch = if b.is_ascii_graphic() || b == b' ' {
                 b as char
             } else {
                 '.'
-            });
+            };
+            ascii_spans.push(Span::styled(ch.to_string(), ascii_style));
         }
-        let style = if is_cursor_line {
-            Style::default().bg(Color::DarkGray).fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        // pad hex for short lines
+        if chunk.len() < 16 {
+            for _ in chunk.len()..16 {
+                hex_spans.push(Span::raw("   "));
+            }
+            for _ in chunk.len()..16 {
+                ascii_spans.push(Span::raw(" "));
+            }
+        }
+        let row_style = if is_cursor_line {
+            Style::default().bg(Color::DarkGray)
         } else {
             Style::default()
         };
@@ -793,10 +809,10 @@ fn draw_raw_hex(f: &mut Frame, area: Rect, app: &InteractiveApp, _file_size: u64
         table_rows.push(
             Row::new(vec![
                 Cell::from(addr_str),
-                Cell::from(hex_str),
-                Cell::from(ascii),
+                Cell::from(Line::from(hex_spans)),
+                Cell::from(Line::from(ascii_spans)),
             ])
-            .style(style)
+            .style(row_style)
             .height(1),
         );
     }
