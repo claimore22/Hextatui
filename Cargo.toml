@@ -1,0 +1,24 @@
+[package]
+name = "hextatui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Hextatui — Cooking some good Hex explorer with Ratatui. A fast, interactive terminal hex/binary explorer."
+readme = "README.md"
+keywords = ["hex", "ratatui", "tui", "binary", "explorer"]
+categories = ["command-line-utilities", "visualization"]
+license = "MIT"
+
+[[bin]]
+name = "hextatui"
+path = "src/main.rs"
+
+[[bin]]
+name = "binary-scan"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+ratatui = "0.29"
+crossterm = "0.28"
